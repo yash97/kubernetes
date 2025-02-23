@@ -28,6 +28,7 @@ import (
 	"time"
 
 	cadvisorapi "github.com/google/cadvisor/info/v1"
+	"google.golang.org/grpc/metadata"
 	"k8s.io/klog/v2"
 
 	v1 "k8s.io/api/core/v1"
@@ -833,8 +834,12 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 	// Since device plugin advertises extended resources,
 	// therefore Requests must be equal to Limits and iterating
 	// over the Limits should be sufficient.
+	var gpusAllocated []string
 	for k, v := range container.Resources.Limits {
 		resource := string(k)
+		if resource == "aws.com/efa" {
+			continue
+		}
 		needed := int(v.Value())
 		klog.V(3).InfoS("Looking for needed resources", "resourceName", resource, "pod", klog.KObj(pod), "containerName", container.Name, "needed", needed)
 		if !m.isDevicePluginResource(resource) {
@@ -880,6 +885,10 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 		}
 
 		devs := allocDevices.UnsortedList()
+
+		if resource == "nvidia.com/gpu" {
+			gpusAllocated = append(gpusAllocated, devs...)
+		}
 		// TODO: refactor this part of code to just append a ContainerAllocationRequest
 		// in a passed in AllocateRequest pointer, and issues a single Allocate call per pod.
 		klog.V(4).InfoS("Making allocation request for device plugin", "devices", devs, "resourceName", resource, "pod", klog.KObj(pod), "containerName", container.Name)
@@ -915,6 +924,98 @@ func (m *ManagerImpl) allocateContainerResources(pod *v1.Pod, container *v1.Cont
 		m.podDevices.insert(podUID, contName, resource, allocDevicesWithNUMA, resp.ContainerResponses[0])
 	}
 
+	// Same loop as above but for efa devices only.
+	for k, v := range container.Resources.Limits {
+		resource := string(k)
+		if resource != "aws.com/efa" {
+			continue
+		}
+		needed := int(v.Value())
+		klog.V(3).InfoS("Looking for needed resources", "resourceName", resource, "pod", klog.KObj(pod), "containerName", container.Name, "needed", needed)
+		if !m.isDevicePluginResource(resource) {
+			continue
+		}
+		// Updates allocatedDevices to garbage collect any stranded resources
+		// before doing the device plugin allocation.
+		// if !allocatedDevicesUpdated {
+		// 	m.UpdateAllocatedDevices()
+		// 	allocatedDevicesUpdated = true
+		// }
+		allocDevices, err := m.devicesToAllocate(podUID, contName, resource, needed, devicesToReuse[resource])
+		if err != nil {
+			return err
+		}
+		if allocDevices == nil || len(allocDevices) <= 0 {
+			continue
+		}
+
+		needsUpdateCheckpoint = true
+
+		startRPCTime := time.Now()
+		// Manager.Allocate involves RPC calls to device plugin, which
+		// could be heavy-weight. Therefore we want to perform this operation outside
+		// mutex lock. Note if Allocate call fails, we may leave container resources
+		// partially allocated for the failed container. We rely on UpdateAllocatedDevices()
+		// to garbage collect these resources later. Another side effect is that if
+		// we have X resource A and Y resource B in total, and two containers, container1
+		// and container2 both require X resource A and Y resource B. Both allocation
+		// requests may fail if we serve them in mixed order.
+		// TODO: may revisit this part later if we see inefficient resource allocation
+		// in real use as the result of this. Should also consider to parallelize device
+		// plugin Allocate grpc calls if it becomes common that a container may require
+		// resources from multiple device plugins.
+		m.mutex.Lock()
+		eI, ok := m.endpoints[resource]
+		m.mutex.Unlock()
+		if !ok {
+			m.mutex.Lock()
+			m.allocatedDevices = m.podDevices.devices()
+			m.mutex.Unlock()
+			return fmt.Errorf("unknown Device Plugin %s", resource)
+		}
+
+		devs := allocDevices.UnsortedList()
+		// TODO: refactor this part of code to just append a ContainerAllocationRequest
+		// in a passed in AllocateRequest pointer, and issues a single Allocate call per pod.
+		klog.V(4).InfoS("Making allocation request for device plugin", "devices", devs, "resourceName", resource, "pod", klog.KObj(pod), "containerName", container.Name)
+
+		//gpuCtx := context.WithValue(context.Background(), gpuContextKey, gpusAllocated)
+		md := metadata.Pairs("gpus-allocated", gpusAllocated[0])
+		if len(gpusAllocated) > 1 {
+			md.Append("gpus-allocated", gpusAllocated[1:]...)
+		}
+		gpuCtx := metadata.NewOutgoingContext(context.Background(), md)
+		resp, err := eI.e.allocateWithContext(gpuCtx, devs)
+		metrics.DevicePluginAllocationDuration.WithLabelValues(resource).Observe(metrics.SinceInSeconds(startRPCTime))
+		if err != nil {
+			// In case of allocation failure, we want to restore m.allocatedDevices
+			// to the actual allocated state from m.podDevices.
+			m.mutex.Lock()
+			m.allocatedDevices = m.podDevices.devices()
+			m.mutex.Unlock()
+			return err
+		}
+
+		if len(resp.ContainerResponses) == 0 {
+			return fmt.Errorf("no containers return in allocation response %v", resp)
+		}
+
+		allocDevicesWithNUMA := checkpoint.NewDevicesPerNUMA()
+		// Update internal cached podDevices state.
+		m.mutex.Lock()
+		for dev := range allocDevices {
+			if m.allDevices[resource][dev].Topology == nil || len(m.allDevices[resource][dev].Topology.Nodes) == 0 {
+				allocDevicesWithNUMA[nodeWithoutTopology] = append(allocDevicesWithNUMA[nodeWithoutTopology], dev)
+				continue
+			}
+			for idx := range m.allDevices[resource][dev].Topology.Nodes {
+				node := m.allDevices[resource][dev].Topology.Nodes[idx]
+				allocDevicesWithNUMA[node.ID] = append(allocDevicesWithNUMA[node.ID], dev)
+			}
+		}
+		m.mutex.Unlock()
+		m.podDevices.insert(podUID, contName, resource, allocDevicesWithNUMA, resp.ContainerResponses[0])
+	}
 	if needsUpdateCheckpoint {
 		return m.writeCheckpoint()
 	}

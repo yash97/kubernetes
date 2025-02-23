@@ -32,6 +32,7 @@ import (
 type endpoint interface {
 	getPreferredAllocation(available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error)
 	allocate(devs []string) (*pluginapi.AllocateResponse, error)
+	allocateWithContext(ctx  context.Context, devs []string) (*pluginapi.AllocateResponse, error) 
 	preStartContainer(devs []string) (*pluginapi.PreStartContainerResponse, error)
 	setStopTime(t time.Time)
 	isStopped() bool
@@ -104,6 +105,17 @@ func (e *endpointImpl) allocate(devs []string) (*pluginapi.AllocateResponse, err
 		return nil, fmt.Errorf(errEndpointStopped, e)
 	}
 	return e.api.Allocate(context.Background(), &pluginapi.AllocateRequest{
+		ContainerRequests: []*pluginapi.ContainerAllocateRequest{
+			{DevicesIDs: devs},
+		},
+	})
+}
+
+func (e *endpointImpl) allocateWithContext(ctx  context.Context, devs []string) (*pluginapi.AllocateResponse, error)  {
+	if e.isStopped() {
+		return nil, fmt.Errorf(errEndpointStopped, e)
+	}
+	return e.api.Allocate(ctx, &pluginapi.AllocateRequest{
 		ContainerRequests: []*pluginapi.ContainerAllocateRequest{
 			{DevicesIDs: devs},
 		},

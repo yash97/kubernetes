@@ -17,6 +17,7 @@ limitations under the License.
 package devicemanager
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -567,6 +568,59 @@ func TestGetAllocatableDevicesHealthTransition(t *testing.T) {
 	as.True(ok)
 	checkAllocatableDevicesConsistsOf(as, devInstances, []string{"R1Device1", "R1Device2", "R1Device3"})
 }
+func TestAllocateContainerResources_GPU_EFA_Order(t *testing.T) {
+	// ✅ Step 1: Create Mock GPU and EFA Endpoints
+	mockGPU := &MockEndpoint{
+		allocateWithContextFunc: func(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error) {
+			// Ensure GPU is allocated first without prior context
+			assert.Empty(t, ctx.Value("gpuAllocated"), "GPU plugin should not receive prior GPU allocation")
+			return &pluginapi.AllocateResponse{
+				ContainerResponses: []*pluginapi.ContainerAllocateResponse{
+					{
+						Envs: map[string]string{"GPU_IDs": "gpu1,gpu2"},
+					},
+				},
+			}, nil
+		},
+	}
+
+	mockEFA := &MockEndpoint{
+		allocateWithContextFunc: func(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error) {
+			// Ensure EFA receives GPU allocation context
+			gpuAllocated := ctx.Value("gpuAllocated")
+			assert.NotNil(t, gpuAllocated, "EFA plugin should receive GPU allocation context")
+			assert.IsType(t, []string{}, gpuAllocated, "GPU allocation should be a list of device IDs")
+			assert.Equal(t, []string{"gpu1", "gpu2"}, gpuAllocated, "EFA should receive GPU IDs")
+			return &pluginapi.AllocateResponse{}, nil
+		},
+	}
+
+	// Step 2: Setup Device Manager
+	mgr := &ManagerImpl{
+		endpoints: map[string]endpointInfo{
+			"nvidia.com/gpu": {e: mockGPU, opts: nil},
+			"aws.com/efa":    {e: mockEFA, opts: nil},
+		},
+		podDevices: newPodDevices(),
+	}
+	
+
+	//  Step 3: Define Pod & Container with GPU and EFA Requests
+	pod := &v1.Pod{}
+	container := &v1.Container{
+		Resources: v1.ResourceRequirements{
+			Limits: v1.ResourceList{
+				"nvidia.com/gpu": resource.MustParse("2"),
+				"aws.com/efa":    resource.MustParse("1"),
+			},
+		},
+	}
+
+	// Step 4: Run Allocation
+	err := mgr.allocateContainerResources(pod, container, map[string]sets.Set[string]{})
+	assert.NoError(t, err, "Allocation should succeed")
+}
+
 
 func checkAllocatableDevicesConsistsOf(as *assert.Assertions, devInstances DeviceInstances, expectedDevs []string) {
 	as.Equal(len(expectedDevs), len(devInstances))
@@ -781,6 +835,7 @@ func (a *activePodsStub) updateActivePods(newPods []*v1.Pod) {
 type MockEndpoint struct {
 	getPreferredAllocationFunc func(available, mustInclude []string, size int) (*pluginapi.PreferredAllocationResponse, error)
 	allocateFunc               func(devs []string) (*pluginapi.AllocateResponse, error)
+	allocateWithContextFunc    func(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error)
 	initChan                   chan []string
 }
 
@@ -799,6 +854,15 @@ func (m *MockEndpoint) getPreferredAllocation(available, mustInclude []string, s
 func (m *MockEndpoint) allocate(devs []string) (*pluginapi.AllocateResponse, error) {
 	if m.allocateFunc != nil {
 		return m.allocateFunc(devs)
+	}
+	return nil, nil
+}
+func (m *MockEndpoint) allocateWithContext(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if m.allocateWithContextFunc != nil {
+		return m.allocateWithContextFunc(ctx, devs)
 	}
 	return nil, nil
 }
